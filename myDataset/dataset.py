@@ -62,12 +62,23 @@ class EvolInstructCode80k(Dataset):
         return {
             "messages":message
         }
-    
-dataset1 = CodeAlpaca("HuggingFaceH4/CodeAlpaca_20K")
-dataset2 = OpcSftStage2("OpenCoder-LLM/opc-sft-stage2")
-dataset3 = EvolInstructCode80k("nickrosh/Evol-Instruct-Code-80k-v1")
 
-mydataset_without_clean = ConcatDataset(
-    [dataset1,dataset2,dataset3]
-)
-print(mydataset_without_clean[0])
+
+
+class MyDataset(Dataset):
+    def __init__(self, path_list=None):
+        if path_list is None:
+            path_list = ["HuggingFaceH4/CodeAlpaca_20K", "OpenCoder-LLM/opc-sft-stage2","nickrosh/Evol-Instruct-Code-80k-v1"] 
+        self.datasets = [
+            CodeAlpaca(path_list[0]),
+            OpcSftStage2(path_list[1]),
+            EvolInstructCode80k(path_list[2])
+        ]
+        self.combined = ConcatDataset(self.datasets)
+    
+    def __len__(self):
+        return len(self.combined)
+    
+    def __getitem__(self, idx):
+        return self.combined[idx]
+
