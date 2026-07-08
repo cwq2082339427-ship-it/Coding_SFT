@@ -1,5 +1,5 @@
 """
-语义去重模块 (Semantic Deduplication)
+语义去重模块
 
 核心思路 (两阶段级联):
   1. instruction 级: 对所有 instruction 做 embedding → FAISS 索引
@@ -20,7 +20,6 @@ import numpy as np
 import logging
 from typing import List, Dict, Tuple, Optional
 
-logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -127,10 +126,9 @@ def compute_embeddings(
     """
     from sentence_transformers import SentenceTransformer
 
-    logger.info(f"加载 embedding 模型: {model_name}")
+
     model = SentenceTransformer(model_name, device=device)
 
-    logger.info(f"计算 {len(texts)} 条文本的 embedding ...")
     embeddings: np.ndarray = model.encode(
         texts,
         batch_size=batch_size,
@@ -146,7 +144,6 @@ def build_faiss_index(embeddings: np.ndarray):
     import faiss
 
     dim = embeddings.shape[1]
-    logger.info(f"构建 FAISS 索引 (dim={dim}, n={len(embeddings)})")
 
     index = faiss.IndexFlatIP(dim)
     index.add(embeddings)
@@ -166,38 +163,9 @@ def semantic_dedup(
     batch_size: int = 64,
     device: str = "cpu",
 ) -> Tuple[List[dict], dict]:
-    """
-    语义去重主函数。
 
-    Parameters
-    ----------
-    dataset : List[dict]
-        每条有 ``messages`` 字段: [{"role":"user","content":...}, {"role":"assistant","content":...}]
-    inst_sim_threshold : float
-        instruction 相似度阈值, 高于此值才进入 output 级比对
-    output_sim_threshold : float
-        output 相似度阈值, 高于此值才归入同一组
-    top_k : int
-        FAISS 搜索的候选数 (实际返回 top_k+1, 包含自身)
-    model_name : str
-        Sentence-Transformer 模型名
-    batch_size : int
-        Embedding 计算的批次大小
-    device : str
-        "cpu" 或 "cuda"
-
-    Returns
-    -------
-    (deduped_dataset, stats)
-        deduped_dataset : 去重后的数据
-        stats           : 去重统计信息
-    """
     n = len(dataset)
-    logger.info("=" * 56)
-    logger.info(f"语义去重开始 | 输入: {n} 条")
-    logger.info(f"  阈值: inst≥{inst_sim_threshold}, output≥{output_sim_threshold}")
-    logger.info(f"  TOP-K: {top_k}  |  模型: {model_name}")
-    logger.info("=" * 56)
+
 
     if n == 0:
         return [], {"total": 0, "removed": 0, "kept": 0, "dup_groups": 0}
@@ -232,7 +200,6 @@ def semantic_dedup(
             checked.add(pair)
             candidate_pairs.append((i, j, sim))
 
-    logger.info(f"  → instruction 候选对: {len(candidate_pairs)}")
 
     # ---- Step 4: output embedding 相似度 → 并查集归组 ----
     uf = UnionFind(n)
@@ -246,10 +213,6 @@ def semantic_dedup(
             if out_sim >= output_sim_threshold:
                 uf.union(i, j)
                 matched += 1
-
-        logger.info(f"  → instruction + output 均匹配: {matched} 对")
-    else:
-        logger.info(f"  → 无候选对, 跳过 output 对比")
 
     # ---- Step 5: 归组 → 组内评分 → 保留最优 ----
     groups: Dict[int, List[int]] = {}
@@ -286,11 +249,5 @@ def semantic_dedup(
         "top_k": top_k,
         "embedding_model": model_name,
     }
-
-    logger.info("=" * 56)
-    logger.info(f"语义去重完成: {n} → {len(deduped)}  (去除 {len(removed_indices)} 条)")
-    if dup_groups:
-        logger.info(f"  共 {dup_groups} 个重复组被合并")
-    logger.info("=" * 56)
 
     return deduped, stats
