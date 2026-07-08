@@ -93,7 +93,7 @@ def run_pipeline(use_semantic_dedup: bool = True) -> List[dict]:
     dataset = MyDataset()
     total_raw = len(dataset)
 
-    # ---- 逐条清洗 (链表式处理, 节省内存) ----
+    # ---- 逐条清洗 
     passed_clean = 0
     passed_length = 0
     filtered_data = []
@@ -137,7 +137,6 @@ def run_pipeline(use_semantic_dedup: bool = True) -> List[dict]:
         final_data = deduped
     else:
         final_data = filtered_data
-        stats = {"kept": len(final_data), "removed": 0, "dup_groups": 0}
 
 
     return final_data
