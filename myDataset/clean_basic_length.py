@@ -13,7 +13,6 @@
 import os
 import json
 import time
-import logging
 from typing import List, Optional
 
 from dataset import MyDataset

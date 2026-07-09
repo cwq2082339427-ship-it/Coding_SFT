@@ -2,7 +2,7 @@
 语义去重模块
 
 核心思路 (两阶段级联):
-  1. instruction 级: 对所有 instruction 做 embedding → FAISS 索引
+  1. instruction 级: 对所有 instruction 做 embedding → 近似度矩阵
      每条搜索 TOP-K, 保留 instruction_sim > threshold_inst 的候选对
   2. output 级: 对候选对计算 output embedding 相似度
      若 output_sim > threshold_out → 并查集归入同一组
@@ -13,13 +13,19 @@
     deduped, stats = semantic_dedup(dataset)
 
 依赖:
-    pip install sentence-transformers faiss-cpu
+    pip install sentence-transformers
+
+注意:
+    - 原本依赖 faiss 进行 TOP-K 搜索, 现改用纯 numpy 批量计算余弦相似度,
+      避免 faiss 安装困难的问题。
+    - 对于超大数据集 (>5 万条), 改用分块 (block-wise) 相似度计算以控制内存。
 """
 
 import numpy as np
 import logging
 from typing import List, Dict, Tuple, Optional
 
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -102,7 +108,7 @@ def score_item(item: dict) -> float:
     if "print(" in output or "return " in output:
         score += 5.0
     if "go" in output:
-        score -= 5.0   #针对一些不规范语言，减少评分。
+        score -= 5.0   # 针对一些不规范语言，减少评分。
 
     # 5. 无代码块的纯文本应答 → 对代码 SFT 价值低
     if code_block_count == 0:
@@ -128,28 +134,138 @@ def compute_embeddings(
     """
     from sentence_transformers import SentenceTransformer
 
-
     model = SentenceTransformer(model_name, device=device)
 
     embeddings: np.ndarray = model.encode(
         texts,
         batch_size=batch_size,
         show_progress_bar=show_progress,
-        normalize_embeddings=True,   # L2 归一化 → FAISS IP = cosine
+        normalize_embeddings=True,   # L2 归一化 → 余弦相似度 = 点积
         convert_to_numpy=True,
     )
     return embeddings
 
 
-def build_faiss_index(embeddings: np.ndarray):
-    """构建 FAISS 内积索引 (归一化后等价于 cosine 相似度)"""
-    import faiss
 
-    dim = embeddings.shape[1]
+def _find_top_k_fast(embeddings: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    批量计算余弦相似度矩阵并获取 TOP-K 索引和分数。
 
-    index = faiss.IndexFlatIP(dim)
-    index.add(embeddings)
-    return index
+    使用整块矩阵乘法 (n × n), 适用于 N ≤ 50000 的中小数据集。
+    返回:
+        top_scores:  shape (n, k)
+        top_indices: shape (n, k)    (均不含自身)
+    """
+    n = embeddings.shape[0]
+    # 余弦相似度 = 点积 (已 L2 归一化)
+    sim = np.dot(embeddings, embeddings.T)          # (n, n)
+
+    # 将对角线 (自身相似度=1) 置为 -inf, 避免排第一
+    np.fill_diagonal(sim, -np.inf)
+
+    # 取每行最大的 k 个
+    # 如果 n-1 < k, 修正 k 为 n-1
+    actual_k = min(k, n - 1)
+    top_indices = np.argpartition(-sim, actual_k - 1, axis=1)[:, :actual_k]
+
+    # argpartition 不保证排序, 再按分数排序这 actual_k 个
+    row_idx = np.arange(n)[:, None]
+    top_scores_before = sim[row_idx, top_indices]
+    # 按分数降序排列
+    sort_order = np.argsort(-top_scores_before, axis=1)
+    top_indices = top_indices[row_idx, sort_order]
+    top_scores = top_scores_before[row_idx, sort_order]
+
+    # 如果要求的 k > actual_k, 用 -1 填充 (但不影响后续过滤,
+    # 因为 score=-inf 不会超过阈值)
+    if actual_k < k:
+        pad = np.full((n, k - actual_k), -1, dtype=top_indices.dtype)
+        top_indices = np.concatenate([top_indices, pad], axis=1)
+        pad_scores = np.full((n, k - actual_k), -np.inf, dtype=top_scores.dtype)
+        top_scores = np.concatenate([top_scores, pad_scores], axis=1)
+
+    return top_scores, top_indices
+
+
+def _find_top_k_blockwise(
+    embeddings: np.ndarray,
+    k: int,
+    block_size: int = 4096,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    分块计算 TOP-K, 避免一次性构建 n×n 矩阵 (内存友好)。
+
+    对于超大 N (>50000) 逐块计算, 每块只需 block_size × n 的临时矩阵。
+    """
+    n = embeddings.shape[0]
+    actual_k = min(k, n - 1)
+
+    # L2 归一化 (虽然外部已归一化, 再确保一次也无妨)
+    norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+    norms = np.where(norms == 0, 1.0, norms)
+    emb_normalized = embeddings / norms
+
+    top_scores = np.full((n, actual_k), -np.inf, dtype=np.float32)
+    top_indices = np.full((n, actual_k), -1, dtype=np.int64)
+
+    # 分块处理: 每次处理 block_size 个 query
+    for start in range(0, n, block_size):
+        end = min(start + block_size, n)
+        block = emb_normalized[start:end]                     # (B, D)
+        sim_block = np.dot(block, emb_normalized.T)           # (B, n)
+
+        # 将对角线上自身相似度置为 -inf
+        for local_i in range(end - start):
+            global_i = start + local_i
+            sim_block[local_i, global_i] = -np.inf
+
+        # 取 TOP-K
+        local_top_indices = np.argpartition(-sim_block, actual_k - 1, axis=1)[:, :actual_k]
+        row_local = np.arange(end - start)[:, None]
+        top_scores_local = sim_block[row_local, local_top_indices]
+
+        # 排序
+        sort_order = np.argsort(-top_scores_local, axis=1)
+        local_top_indices = local_top_indices[row_local, sort_order]
+        top_scores_local = top_scores_local[row_local, sort_order]
+
+        top_indices[start:end] = local_top_indices
+        top_scores[start:end] = top_scores_local
+
+    # 如果要求的 k > actual_k, 填充
+    if actual_k < k:
+        pad_idx = np.full((n, k - actual_k), -1, dtype=np.int64)
+        top_indices = np.concatenate([top_indices, pad_idx], axis=1)
+        pad_scores = np.full((n, k - actual_k), -np.inf, dtype=np.float32)
+        top_scores = np.concatenate([top_scores, pad_scores], axis=1)
+
+    return top_scores, top_indices
+
+
+def find_top_k(
+    embeddings: np.ndarray,
+    k: int,
+    block_size: int = 4096,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    统一入口: 根据数据规模自动选择整块 / 分块策略。
+
+    参数:
+        embeddings: (n, dim) L2 归一化后的 embedding
+        k: 每个 query 返回的最近邻数
+        block_size: 分块大小, 仅对超大 N 生效
+
+    返回:
+        top_scores:  shape (n, k)
+        top_indices: shape (n, k)   (均不含自身)
+                      未达到 k 个时, index = -1, score = -inf
+    """
+    n = embeddings.shape[0]
+    if n <= 50000:
+        return _find_top_k_fast(embeddings, k)
+    else:
+        logger.info(f"数据集较大 (n={n}), 采用分块 TOP-K 搜索, block_size={block_size}")
+        return _find_top_k_blockwise(embeddings, k, block_size=block_size)
 
 
 # ---------------------------------------------------------------------------
@@ -168,7 +284,6 @@ def semantic_dedup(
 
     n = len(dataset)
 
-
     if n == 0:
         return [], {"total": 0, "removed": 0, "kept": 0, "dup_groups": 0}
 
@@ -176,22 +291,23 @@ def semantic_dedup(
     instructions = [item["messages"][0]["content"] for item in dataset]
     outputs = [item["messages"][1]["content"] for item in dataset]
 
-    # ---- Step 2: instruction embedding → FAISS 索引 → TOP-K 搜索 ----
+    # ---- Step 2: instruction embedding → TOP-K 搜索 ----
     inst_emb = compute_embeddings(instructions, model_name, batch_size, device)
-    index = build_faiss_index(inst_emb)
 
-    k = min(top_k + 1, n)               # +1 因为首位是自身
-    top_scores, top_indices = index.search(inst_emb, k)
+    k = min(top_k + 1, n)             # +1 因为首位是自身; find_top_k 会跳过自身
+    top_scores, top_indices = find_top_k(inst_emb, k)
 
     # ---- Step 3: 筛选 instruction 相似候选对 ----
-    candidate_pairs = []                # [(i, j, inst_sim), ...]
+    candidate_pairs = []              # [(i, j, inst_sim), ...]
     checked = set()
     for i in range(n):
-        for pos in range(1, k):         # 跳过自身 (pos=0)
+        for pos in range(k):
             j = int(top_indices[i][pos])
             sim = float(top_scores[i][pos])
 
-            if j <= i:                  # 避免重复对; 同时排除自身
+            if j < 0:                 # 填充的无效位
+                continue
+            if j <= i:                # 避免重复对
                 continue
             if sim < inst_sim_threshold:
                 continue
@@ -201,7 +317,6 @@ def semantic_dedup(
                 continue
             checked.add(pair)
             candidate_pairs.append((i, j, sim))
-
 
     # ---- Step 4: output embedding 相似度 → 并查集归组 ----
     uf = UnionFind(n)

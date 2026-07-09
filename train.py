@@ -358,6 +358,10 @@ def train(config: TrainingConfig):
     logger.info("步骤 5/5: 开始 SFT 训练")
     logger.info("=" * 60)
 
+    # response_template: 告诉 SFTTrainer 只对 assistant 回复部分计算 loss
+    # Qwen2.5 的 chat_template 中 assistant 回复以 "<|im_start|>assistant" 开头
+    response_template = "<|im_start|>assistant"
+
     trainer = SFTTrainer(
         model=model,
         tokenizer=tokenizer,
@@ -366,6 +370,7 @@ def train(config: TrainingConfig):
         eval_dataset=eval_dataset,
         max_seq_length=config.max_seq_length,
         dataset_text_field="text",
+        response_template=response_template,
         neftune_noise_alpha=config.neftune_noise_alpha,
         callbacks=[ProgressCallback()],
     )
