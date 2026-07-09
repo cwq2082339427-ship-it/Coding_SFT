@@ -98,9 +98,11 @@ def score_item(item: dict) -> float:
     if "def " in output:
         score += 8.0
     if "class " in output:
-        score += 8.0
+        score += 10.0
     if "print(" in output or "return " in output:
         score += 5.0
+    if "go" in output:
+        score -= 5.0   #针对一些不规范语言，减少评分。
 
     # 5. 无代码块的纯文本应答 → 对代码 SFT 价值低
     if code_block_count == 0:
