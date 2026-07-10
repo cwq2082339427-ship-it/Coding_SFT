@@ -15,8 +15,8 @@ import json
 import time
 from typing import List, Optional
 
-from dataset import MyDataset
-from clean_deduplicate import semantic_dedup
+from myDataset.dataset import MyDataset
+from myDataset.clean_deduplicate import semantic_dedup
 
 # 长度过滤阈值 
 MIN_PROMPT_WORDS = 5
